@@ -16,6 +16,8 @@ import type {
     StorageIdentifier,
     StorageWritePolicy,
 } from '@crawlee/core';
+import type { UrlVisitClaim } from '@crawlee/core/internal';
+import { UrlVisitTracker } from '@crawlee/core/internal';
 import {
     bindMethodsToServiceLocator,
     Configuration,
@@ -909,6 +911,12 @@ export class BasicCrawler<
     readonly #storageWritePolicy: Partial<StorageWritePolicy>;
     readonly #onSkippedRequest?: SkippedRequestCallback;
     readonly #robotsTxtFileCache: LruCache<RobotsTxtFile>;
+
+    /**
+     * Canonical URLs already claimed or visited by this run. Bounded, and reset between runs so a purged
+     * queue can crawl the same URLs again.
+     */
+    readonly #visitTracker = new UrlVisitTracker();
     readonly #identity: CrawlerIdentity;
     readonly #contextPipelineOptions: {
         contextPipelineBuilder?: () => ContextPipeline<CrawlingContext, Context>;
@@ -1695,6 +1703,9 @@ export class BasicCrawler<
                         'This crawler instance is already running, you can add more requests to it via `crawler.addRequests()`.',
                     );
                 }
+                // A fresh run starts from a clean visit state. Requests already handled in the queue
+                // stay handled on their own; this only resets the bounded redirect-alias memory.
+                this.#visitTracker.clear();
                 // An owned governor is rebuilt for every run, so it always starts from a clean slate — stale
                 // resource snapshots or a previous run's scaled desired concurrency would otherwise distort this
                 // run's scaling. An injected one is long-lived and its lifecycle belongs to the caller.
@@ -1845,6 +1856,8 @@ export class BasicCrawler<
 
                     await run.finish();
                     await this.#concurrencySystem.ifOwned((system) => system.stop());
+                    // Do not let visit state from this run suppress requests added between runs.
+                    this.#visitTracker.clear();
                     this.#hasFinishedBefore = true;
                 }
 
@@ -2119,6 +2132,8 @@ export class BasicCrawler<
         const hasSkippedRequestCallback =
             this.#onSkippedRequest !== undefined || options.onSkippedRequest !== undefined;
         const keepSkippedSource = (source: Source) => (hasSkippedRequestCallback ? source : source.url!);
+        const getEnqueueVisitKey = (options: RequestOptions) => this.#getEnqueueVisitKey(options);
+        const visitTracker = this.#visitTracker;
 
         const reportSkippedRequests = async () => {
             const skippedRequests = allSkipped.splice(0);
@@ -2215,6 +2230,13 @@ export class BasicCrawler<
                 }
 
                 await validateRequestUserData(finalOptions);
+
+                const visitKey = getEnqueueVisitKey(finalOptions);
+                if (visitKey && visitTracker.isSeen(visitKey)) {
+                    allSkipped.push({ source: keepSkippedSource(finalOptions), reason: 'duplicate' });
+                    continue;
+                }
+
                 yield new Request(finalOptions);
             }
         }
@@ -2245,6 +2267,31 @@ export class BasicCrawler<
         void waitForAllRequestsToBeAdded.catch(() => {});
 
         return { ...result, waitForAllRequestsToBeAdded };
+    }
+
+    /**
+     * The canonical visit key for a request that is about to be enqueued, or `null` when the caller chose
+     * its own identity (a custom `uniqueKey`, `useExtendedUniqueKey` or `alwaysEnqueue`). Custom identities
+     * explicitly opt out of URL-level deduplication.
+     */
+    #getEnqueueVisitKey(options: RequestOptions): string | null {
+        if (options.useExtendedUniqueKey || options.alwaysEnqueue) {
+            return null;
+        }
+
+        const automaticKey = Request.computeUniqueKey({
+            url: options.url,
+            method: 'GET',
+            keepUrlFragment: options.keepUrlFragment,
+        });
+
+        // A stored `Request` always carries its computed `uniqueKey`; only an identity that differs from
+        // the automatic one is a caller-chosen key that opts out of URL-level dedup.
+        if (options.uniqueKey !== undefined && options.uniqueKey !== automaticKey) {
+            return null;
+        }
+
+        return this.#toVisitKey(automaticKey);
     }
 
     /**
@@ -2629,28 +2676,141 @@ export class BasicCrawler<
         }
 
         const { request } = crawlingContext;
+        const visitClaim = await this.#claimRequestVisit(request);
 
         request.state = RequestState.REQUEST_HANDLER;
-        await this.runRequestHandler(crawlingContext);
+        try {
+            await this.runRequestHandler(crawlingContext);
 
-        // Commit *before* marking the request as handled, so a commit failure fails the request and
-        // it is retried. This also closes the transaction, so everything below passes through.
-        // Opened by `runInStorageTransaction`; absent when disabled or when the subclass opens its own.
-        await currentStorageTransaction()?.commit();
+            // Commit *before* marking the request as handled, so a commit failure fails the request and
+            // it is retried. This also closes the transaction, so everything below passes through.
+            // Opened by `runInStorageTransaction`; absent when disabled or when the subclass opens its own.
+            await currentStorageTransaction()?.commit();
 
-        await this.#timeoutAndRetry(
-            async () => requestSource.markRequestAsHandled(request),
-            this.internalTimeoutMillis,
-            `Marking request ${request.url} (${request.id}) as handled timed out after ${
-                this.internalTimeoutMillis / 1e3
-            } seconds.`,
-        );
+            await this.#timeoutAndRetry(
+                async () => requestSource.markRequestAsHandled(request),
+                this.internalTimeoutMillis,
+                `Marking request ${request.url} (${request.id}) as handled timed out after ${
+                    this.internalTimeoutMillis / 1e3
+                } seconds.`,
+            );
 
-        this.statistics.recordRequestSuccess(request.id || request.uniqueKey, request.retryCount);
+            this.statistics.recordRequestSuccess(request.id || request.uniqueKey, request.retryCount);
 
-        // reclaim session if request finishes successfully
-        request.state = RequestState.DONE;
-        crawlingContext.session.markGood();
+            // reclaim session if request finishes successfully
+            request.state = RequestState.DONE;
+            crawlingContext.session.markGood();
+
+            // Only a fully settled request counts as visited. A handler or storage failure releases the
+            // claim, so the retry is allowed to run again.
+            visitClaim?.commit();
+        } catch (error) {
+            visitClaim?.release();
+            throw error;
+        }
+    }
+
+    /**
+     * Claims the canonical URL a request actually lands on. A redirect can turn many distinct request
+     * URLs into the same page; claiming `loadedUrl` (rather than only `request.url`) makes the second
+     * one skip the handler. The claim is only taken for requests whose `uniqueKey` was derived
+     * automatically - custom keys and `alwaysEnqueue` explicitly ask for independent visits.
+     */
+    async #claimRequestVisit(request: CrawlingRequest): Promise<UrlVisitClaim | null> {
+        const keyMode = this.#detectAutomaticKeyMode(request);
+        if (!keyMode) {
+            return null;
+        }
+
+        const requestKey = this.#toVisitKey(request.uniqueKey);
+        // `skipNavigation` requests hide `loadedUrl` behind a throwing getter: there was no navigation,
+        // so the requested URL is the only URL they can have visited.
+        const loadedUrl = request.skipNavigation ? request.url : (request.loadedUrl ?? request.url);
+        const loadedKey = this.#toVisitKey(this.#computeKeyForMode(loadedUrl, keyMode, request));
+        const keys = loadedKey === requestKey ? [loadedKey] : [requestKey, loadedKey];
+        const claim = await this.#visitTracker.claim(keys);
+
+        if (!claim) {
+            throw new ContextPipelineInterruptedError(
+                'duplicate',
+                `Skipping request ${request.url} because ${loadedUrl} has already been visited.`,
+            );
+        }
+
+        return claim;
+    }
+
+    /**
+     * A visit key is scheme-insensitive, unlike the request's `uniqueKey`: an `http://` page that redirects
+     * to `https://` (or a link using the other scheme) is the same page for visit accounting. The queue
+     * still sees the original, scheme-sensitive `uniqueKey`, so custom identities and persistence are
+     * unaffected.
+     */
+    #toVisitKey(uniqueKey: string): string {
+        return uniqueKey.replace(/(^|\|)https?:\/\//, '$1//');
+    }
+
+    /**
+     * Finds how a request's automatic `uniqueKey` was produced, if it was automatic at all. This lets a
+     * fetched request be recognized as automatic even though its stored schema always carries `uniqueKey`.
+     */
+    #detectAutomaticKeyMode(request: Request): { keepUrlFragment: boolean; useExtendedUniqueKey: boolean } | null {
+        const urlHasFragment = request.url.includes('#');
+        const defaultKey = Request.computeUniqueKey({ url: request.url, method: 'GET' });
+
+        if (request.uniqueKey === defaultKey) {
+            return { keepUrlFragment: false, useExtendedUniqueKey: false };
+        }
+
+        if (
+            urlHasFragment &&
+            request.uniqueKey === Request.computeUniqueKey({ url: request.url, method: 'GET', keepUrlFragment: true })
+        ) {
+            return { keepUrlFragment: true, useExtendedUniqueKey: false };
+        }
+
+        if (request.uniqueKey.includes('|')) {
+            const extendedKey = Request.computeUniqueKey({
+                url: request.url,
+                method: request.method,
+                payload: request.payload,
+                useExtendedUniqueKey: true,
+            });
+
+            if (request.uniqueKey === extendedKey) {
+                return { keepUrlFragment: false, useExtendedUniqueKey: true };
+            }
+
+            if (
+                urlHasFragment &&
+                request.uniqueKey ===
+                    Request.computeUniqueKey({
+                        url: request.url,
+                        method: request.method,
+                        payload: request.payload,
+                        keepUrlFragment: true,
+                        useExtendedUniqueKey: true,
+                    })
+            ) {
+                return { keepUrlFragment: true, useExtendedUniqueKey: true };
+            }
+        }
+
+        return null;
+    }
+
+    #computeKeyForMode(
+        url: string,
+        mode: { keepUrlFragment: boolean; useExtendedUniqueKey: boolean },
+        request: Request,
+    ): string {
+        return Request.computeUniqueKey({
+            url,
+            method: request.method,
+            payload: request.payload,
+            keepUrlFragment: mode.keepUrlFragment,
+            useExtendedUniqueKey: mode.useExtendedUniqueKey,
+        });
     }
 
     /**

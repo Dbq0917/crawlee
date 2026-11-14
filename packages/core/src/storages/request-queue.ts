@@ -48,6 +48,13 @@ import { RequestDeduplicationCache } from './request-dedup-cache.js';
  */
 const MAX_CACHED_REQUESTS = 2_000_000;
 
+/**
+ * Upper bound on the number of request additions that are coalesced at once. Entries are removed as
+ * soon as their backend call settles, so this only caps a pathological number of concurrent callers;
+ * hitting it degrades to a normal (deduplicated by the backend) add rather than growing without bound.
+ */
+const MAX_PENDING_REQUEST_ADDS = 100_000;
+
 const iterableSchema = z.custom((value) => isIterable(value) || isAsyncIterable(value), {
     error: (issue) => `Expected an iterable or async iterable, got ${getObjectType(issue.input)}`,
 });
@@ -143,6 +150,12 @@ export class RequestQueue implements IStorage, IRequestManager {
      * See {@link RequestDeduplicationCache} for why this is a separate, cheaper cache.
      */
     #requestSeenCache: RequestDeduplicationCache;
+
+    /**
+     * In-flight additions keyed by `uniqueKey`. Concurrent callers that ask for the same request share
+     * one backend write instead of racing to submit it; the backend is still the final source of truth.
+     */
+    #pendingAdds = new Map<string, Promise<RequestQueueOperationInfo>>();
 
     #queuePausedForMigration = false;
 
@@ -267,19 +280,80 @@ export class RequestQueue implements IStorage, IRequestManager {
             };
         }
 
+        const knownRequestId = this.#requestSeenCache.get(cacheKey);
+        if (knownRequestId) {
+            request.id = knownRequestId;
+            this.#recordRequestJournalEntry(transaction, [request], forefront, true);
+            return {
+                wasAlreadyPresent: true,
+                wasAlreadyHandled: false,
+                requestId: knownRequestId,
+                uniqueKey: request.uniqueKey,
+                forefront,
+            };
+        }
+
+        const pending = this.#pendingAdds.get(request.uniqueKey);
+        if (pending) {
+            const existing = await pending;
+            request.id = existing.requestId;
+            this.#recordRequestJournalEntry(transaction, [request], forefront, true);
+            return {
+                ...existing,
+                wasAlreadyPresent: true,
+                forefront,
+            };
+        }
+
+        const addition = this.#addRequestOnce(request, forefront, cacheKey);
+        this.#trackPendingAddition(request.uniqueKey, addition);
+        const queueOperationInfo = await addition;
+
+        request.id = queueOperationInfo.requestId;
+        this.#recordRequestJournalEntry(transaction, [request], forefront, true);
+
+        return queueOperationInfo;
+    }
+
+    /**
+     * Performs exactly one backend addition for a request and records its result in the in-memory caches.
+     * The returned promise is shared by concurrent callers through {@link #pendingAdds}.
+     */
+    async #addRequestOnce(request: Request, forefront: boolean, cacheKey: string): Promise<RequestQueueOperationInfo> {
         this.#statsTracker.add('writeCount');
         const { processedRequests } = await this.backend.addBatchOfRequests([request], { forefront });
-        this.#recordRequestJournalEntry(transaction, [request], forefront, true);
         const queueOperationInfo = {
             ...processedRequests[0],
             uniqueKey: request.uniqueKey,
             forefront,
         } satisfies RequestQueueOperationInfo;
 
+        request.id = queueOperationInfo.requestId;
         this.#cacheRequest(cacheKey, queueOperationInfo);
-        this.#requestSeenCache.add(cacheKey, request.id!);
+        this.#requestSeenCache.add(cacheKey, queueOperationInfo.requestId);
 
         return queueOperationInfo;
+    }
+
+    /**
+     * Remembers an in-flight addition so another caller asking for the same `uniqueKey` awaits it instead
+     * of issuing its own write. Cleanup is tied to completion, so the map cannot retain settled entries.
+     */
+    #trackPendingAddition(uniqueKey: string, addition: Promise<RequestQueueOperationInfo>): void {
+        if (this.#pendingAdds.size >= MAX_PENDING_REQUEST_ADDS) {
+            return;
+        }
+
+        this.#pendingAdds.set(uniqueKey, addition);
+
+        void addition
+            .finally(() => {
+                if (this.#pendingAdds.get(uniqueKey) === addition) {
+                    this.#pendingAdds.delete(uniqueKey);
+                }
+            })
+            // The original promise's rejection is observed by its caller; this chain only cleans up.
+            .catch(() => {});
     }
 
     /**
@@ -528,6 +602,8 @@ export class RequestQueue implements IStorage, IRequestManager {
         this.#recordRequestJournalEntry(transaction, requests, forefront, true);
 
         const requestsToAdd = new Map<string, Request>();
+        const inFlightRequests: { request: Request; addition: Promise<RequestQueueOperationInfo> }[] = [];
+        const duplicateRequests: Request[] = [];
 
         for (const request of requests) {
             const cacheKey = getCachedRequestId(request.uniqueKey);
@@ -544,27 +620,105 @@ export class RequestQueue implements IStorage, IRequestManager {
                     requestId: knownRequestId,
                     uniqueKey: request.uniqueKey,
                 });
-            } else if (!requestsToAdd.has(request.uniqueKey)) {
-                requestsToAdd.set(request.uniqueKey, request);
+            } else {
+                const pending = this.#pendingAdds.get(request.uniqueKey);
+
+                if (pending) {
+                    inFlightRequests.push({ request, addition: pending });
+                } else if (!requestsToAdd.has(request.uniqueKey)) {
+                    requestsToAdd.set(request.uniqueKey, request);
+                } else {
+                    duplicateRequests.push(request);
+                }
             }
         }
 
         // Early exit if all provided requests were already added
         if (!requestsToAdd.size) {
+            for (const { request, addition } of inFlightRequests) {
+                const info = await addition;
+                request.id = info.requestId;
+                results.processedRequests.push({
+                    wasAlreadyPresent: true,
+                    wasAlreadyHandled: info.wasAlreadyHandled,
+                    requestId: info.requestId,
+                    uniqueKey: request.uniqueKey,
+                });
+            }
+
             return results;
         }
 
-        this.#statsTracker.add('writeCount');
-        const apiResults = await this.backend.addBatchOfRequests([...requestsToAdd.values()], { forefront });
+        const batchPromise = this.#addBatchOnce([...requestsToAdd.values()], forefront, cache, getCachedRequestId);
+
+        // Share the one backend call with concurrent callers. The per-key view lets a follower whose batch
+        // overlaps only partially with this one await precisely the request it cares about.
+        for (const uniqueKey of requestsToAdd.keys()) {
+            const addition = batchPromise.then((apiResults) => {
+                const processed = apiResults.processedRequests.find((request) => request.uniqueKey === uniqueKey);
+
+                if (!processed) {
+                    throw new Error(`Request ${uniqueKey} was not processed by the request queue backend.`);
+                }
+
+                return { ...processed, uniqueKey, forefront } satisfies RequestQueueOperationInfo;
+            });
+
+            this.#trackPendingAddition(uniqueKey, addition);
+        }
+
+        const apiResults = await batchPromise;
 
         // Report unprocessed requests
-        results.unprocessedRequests = apiResults.unprocessedRequests;
+        results.unprocessedRequests.push(...apiResults.unprocessedRequests);
 
-        // Add all new requests to the requestCache
         for (const newRequest of apiResults.processedRequests) {
             // Add the new request to the processed list
             results.processedRequests.push(newRequest);
+        }
 
+        // Requests repeated within this same batch were not submitted twice, but the caller still gets one
+        // result per input item, marked as already present.
+        for (const request of duplicateRequests) {
+            const processed = apiResults.processedRequests.find(({ uniqueKey }) => uniqueKey === request.uniqueKey);
+
+            if (processed) {
+                results.processedRequests.push({
+                    ...processed,
+                    wasAlreadyPresent: true,
+                });
+            }
+        }
+
+        // Another caller already submitted these; await its result rather than writing again.
+        for (const { request, addition } of inFlightRequests) {
+            const info = await addition;
+            request.id = info.requestId;
+            results.processedRequests.push({
+                wasAlreadyPresent: true,
+                wasAlreadyHandled: info.wasAlreadyHandled,
+                requestId: info.requestId,
+                uniqueKey: request.uniqueKey,
+            });
+        }
+
+        return results;
+    }
+
+    /**
+     * Performs one backend batch write and populates the local caches. Kept separate from the public
+     * `addRequests()` so concurrent callers can share the promise through {@link #pendingAdds}.
+     */
+    async #addBatchOnce(
+        requests: Request[],
+        forefront: boolean,
+        cache: boolean,
+        getCachedRequestId: (uniqueKey: string) => string,
+    ): Promise<BatchAddRequestsResult> {
+        this.#statsTracker.add('writeCount');
+        const apiResults = await this.backend.addBatchOfRequests(requests, { forefront });
+
+        for (const newRequest of apiResults.processedRequests) {
             const cacheKey = getCachedRequestId(newRequest.uniqueKey);
 
             if (cache) {
@@ -575,7 +729,7 @@ export class RequestQueue implements IStorage, IRequestManager {
             this.#requestSeenCache.add(cacheKey, newRequest.requestId!);
         }
 
-        return results;
+        return apiResults;
     }
 
     /**
@@ -920,6 +1074,7 @@ export class RequestQueue implements IStorage, IRequestManager {
         // Reset in-memory bookkeeping so the queue behaves as if freshly opened.
         this.#requestCache.clear();
         this.#requestSeenCache.clear();
+        this.#pendingAdds.clear();
         this.#inProgressRequestBatchCount = 0;
 
         // Reset the expected-processing-time high-water mark too, otherwise the monotonic-raise guard

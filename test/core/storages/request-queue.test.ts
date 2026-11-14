@@ -75,6 +75,79 @@ describe('RequestQueue remote', () => {
         expect(await queue.fetchNextRequest()).toBeNull();
     });
 
+    test('coalesces concurrent additions of the same uniqueKey into a single backend write', async () => {
+        const queue = await RequestQueue.open();
+
+        let submittedCount = 0;
+        const addBatchOfRequests = queue.backend.addBatchOfRequests.bind(queue.backend);
+        vitest.spyOn(queue.backend, 'addBatchOfRequests').mockImplementation(async (requests, options) => {
+            submittedCount += requests.length;
+            await sleep(10);
+            return addBatchOfRequests(requests, options);
+        });
+
+        const results = await Promise.all(
+            Array.from({ length: 50 }, () => queue.addRequest({ url: 'http://example.com/coalesced' })),
+        );
+
+        expect(submittedCount).toBe(1);
+        expect(results.filter((request) => !request.wasAlreadyPresent)).toHaveLength(1);
+        expect(new Set(results.map((request) => request.requestId)).size).toBe(1);
+
+        const fetched = await queue.fetchNextRequest();
+        expect(fetched!.url).toBe('http://example.com/coalesced');
+        expect(await queue.fetchNextRequest()).toBeNull();
+    });
+
+    test('deduplicates URLs that differ only in query parameter order', async () => {
+        const queue = await RequestQueue.open();
+
+        const [first, second] = await Promise.all([
+            queue.addRequest({ url: 'http://example.com/page?b=2&a=1' }),
+            queue.addRequest({ url: 'http://example.com/page?a=1&b=2' }),
+        ]);
+
+        expect(first.uniqueKey).toBe('http://example.com/page?a=1&b=2');
+        expect(second.uniqueKey).toBe(first.uniqueKey);
+        expect([first.wasAlreadyPresent, second.wasAlreadyPresent].filter(Boolean)).toEqual([true]);
+
+        const fetched = await queue.fetchNextRequest();
+        expect(fetched!.uniqueKey).toBe(first.uniqueKey);
+        expect(await queue.fetchNextRequest()).toBeNull();
+    });
+
+    test('coalesces concurrent addRequests() batches that overlap', async () => {
+        const queue = await RequestQueue.open();
+
+        let submittedCount = 0;
+        const addBatchOfRequests = queue.backend.addBatchOfRequests.bind(queue.backend);
+        vitest.spyOn(queue.backend, 'addBatchOfRequests').mockImplementation(async (requests, options) => {
+            submittedCount += requests.length;
+            await sleep(10);
+            return addBatchOfRequests(requests, options);
+        });
+
+        const [first, second] = await Promise.all([
+            queue.addRequests([{ url: 'http://example.com/shared' }]),
+            queue.addRequests([{ url: 'http://example.com/shared' }, { url: 'http://example.com/extra' }]),
+        ]);
+
+        expect(submittedCount).toBe(2);
+        expect(first.processedRequests).toHaveLength(1);
+        expect(second.processedRequests).toHaveLength(2);
+        expect(first.processedRequests[0].requestId).toBe(
+            second.processedRequests.find(({ uniqueKey }) => uniqueKey === 'http://example.com/shared')!.requestId,
+        );
+
+        const fetched: string[] = [];
+        for (let request = await queue.fetchNextRequest(); request !== null; request = await queue.fetchNextRequest()) {
+            fetched.push(request.url);
+            await queue.markRequestAsHandled(request);
+        }
+
+        expect(fetched.sort()).toEqual(['http://example.com/extra', 'http://example.com/shared']);
+    });
+
     test('a handled request is not fetched again and checkReadiness() reports finished', async () => {
         const queue = await RequestQueue.open();
 

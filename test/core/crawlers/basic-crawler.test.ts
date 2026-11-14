@@ -8,6 +8,7 @@ import { text } from 'node:stream/consumers';
 import type {
     BasicCrawlerOptions,
     CalculatedStatistics,
+    CrawlingContext,
     EnqueueLinksOptions,
     ErrorHandler,
     IConcurrencySystem,
@@ -24,6 +25,7 @@ import {
     ContextPipelineInterruptedError,
     ConcurrencySystem,
     Configuration,
+    ContextPipeline,
     CriticalError,
     Dataset,
     defaultRoute,
@@ -385,6 +387,66 @@ describe('BasicCrawler', () => {
         // The rebuilt governor starts over from the default desired concurrency (the immediate autoscale tick on
         // start may already have nudged it up a step) instead of inheriting the previous run's value.
         expect(secondSystem.desiredConcurrency).toBeLessThanOrEqual(2);
+    });
+
+    test('visits a redirect target once under concurrency, regardless of query parameter order', async () => {
+        const redirects: Record<string, string> = {
+            'https://example.com/alias-a': 'https://example.com/target?x=1&y=2',
+            'https://example.com/alias-b': 'https://example.com/target?y=2&x=1',
+            'https://example.com/alias-c': 'https://example.com/target?x=1&y=2#section',
+        };
+        const visited: string[] = [];
+        const duplicates: string[] = [];
+
+        const crawler = new BasicCrawler({
+            minConcurrency: 10,
+            maxConcurrency: 10,
+            contextPipelineBuilder: () =>
+                ContextPipeline.create<CrawlingContext>().compose(async (context) => {
+                    context.request.loadedUrl = redirects[context.request.url] ?? context.request.url;
+                    return context;
+                }),
+            onSkippedRequest: ({ reason, request }) => {
+                if (reason === 'duplicate') {
+                    duplicates.push(request.url);
+                }
+            },
+            requestHandler: async ({ request }) => {
+                visited.push(request.loadedUrl!);
+            },
+        });
+
+        await crawler.run(Object.keys(redirects));
+
+        expect(visited).toEqual(['https://example.com/target?x=1&y=2']);
+        expect(duplicates).toHaveLength(2);
+    });
+
+    test('does not enqueue a redirect target that is already being visited', async () => {
+        const visited: string[] = [];
+        const duplicates: string[] = [];
+
+        const crawler = new BasicCrawler({
+            contextPipelineBuilder: () =>
+                ContextPipeline.create<CrawlingContext>().compose(async (context) => {
+                    context.request.loadedUrl = 'https://example.com/target?x=1&y=2';
+                    return context;
+                }),
+            onSkippedRequest: ({ reason, request }) => {
+                if (reason === 'duplicate') {
+                    duplicates.push(request.url);
+                }
+            },
+            requestHandler: async ({ request, addRequests }) => {
+                visited.push(request.url);
+                await addRequests(['http://example.com/target?y=2&x=1']);
+            },
+        });
+
+        await crawler.run(['https://example.com/alias']);
+
+        expect(visited).toEqual(['https://example.com/alias']);
+        expect(duplicates).toEqual(['http://example.com/target?y=2&x=1']);
     });
 
     test('running tracks the run in progress', async () => {

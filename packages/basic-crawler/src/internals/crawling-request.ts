@@ -11,6 +11,7 @@ export type SkippedRequestReason =
     | 'filters'
     | 'transform'
     | 'redirect'
+    | 'duplicate'
     | 'depth'
     | 'manual';
 

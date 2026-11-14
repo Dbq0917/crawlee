@@ -6,10 +6,11 @@ import type { EnqueueStrategy } from '@crawlee/utils';
 import type { IsEqual } from 'type-fest';
 import { z } from 'zod';
 
-import { cryptoRandomObjectId, normalizeUrl } from '@apify/utilities';
+import { cryptoRandomObjectId } from '@apify/utilities';
 
 import { serviceLocator } from './service-locator.js';
 import { snapshotValue } from './storages/transaction.js';
+import { canonicalizeUrl } from './url.js';
 import { parseArgument, schemas } from './validators.js';
 
 /** The `strategy` option accepted by {@apilink ExtractLinksOptions} and {@apilink EnqueueUrlsOptions}. */
@@ -330,7 +331,7 @@ class CrawleeRequest<UserData extends Dictionary = Dictionary> {
         alwaysEnqueue = false,
     }: ComputeUniqueKeyOptions) {
         const normalizedMethod = method.toUpperCase();
-        const normalizedUrl = normalizeUrl(url, keepUrlFragment) || url; // It returns null when url is invalid, causing weird errors.
+        const normalizedUrl = canonicalizeUrl(url, { keepUrlFragment }) || url; // It returns null when url is invalid, causing weird errors.
 
         let uniqueKey: string;
 

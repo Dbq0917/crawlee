@@ -7,3 +7,4 @@ export * from './system-info/memory-info.js';
 export * from './system-info/ps-tree.js';
 export * from './system-info/runtime.js';
 export * from './url.js';
+export * from './storages/url-visit-tracker.js';
